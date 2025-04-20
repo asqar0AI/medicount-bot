@@ -1,0 +1,28 @@
+# virtual environment files 
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# pycache
+__pycache__/
+*.py[cod]
+
+# config
+.env
+
+# logs
+*.log
+logs/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
