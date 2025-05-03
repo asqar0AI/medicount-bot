@@ -21,7 +21,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from pymongo.errors import DuplicateKeyError
@@ -44,8 +44,54 @@ load_dotenv()
 API_TOKEN = os.getenv("API_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME")
+MED_COLLECTION_NAME = os.getenv("COLLECTION_NAME")
 BOT_USERNAME = os.getenv("BOT_USERNAME")
+
+HELP_TEXT = """
+📖 Руководство по использованию бота "Домашняя аптечка"
+
+Этот бот предназначен для управления списком ваших лекарств. Ниже описаны его основные функции:
+
+1.  <b>Добавление лекарства</b> ➕
+    •   Для добавления нового препарата используйте кнопку "➕ Добавить лекарство" в главном меню.
+    •   Введите <b>название</b> препарата или отправьте <b>фотографию упаковки со штрихкодом</b> для автоматического распознавания (бот попытается определить название).
+    •   Далее бот последовательно запросит следующую информацию:
+        ◦   <b>Количество</b> (например: "10 табл.", "50 мл", "1 блистер")
+        ◦   <b>Срок годности</b> (можно указать вручную в формате ГГГГ-ММ-ДД или выбрать дату в календаре)
+        ◦   <b>Заметку</b> (например: "Дозировка 100мг", "После еды". Укажите "-", если заметка не требуется).
+
+2.  <b>Просмотр списка</b> 💊
+    •   Нажмите "💊 Список лекарств" для отображения всех добавленных препаратов.
+    •   При наличии большого количества записей используйте кнопки пагинации "◀️ Пред." и "След. ▶️" для перемещения между страницами.
+
+3.  <b>Просмотр и изменение деталей</b> ✏️
+    •   В списке лекарств нажмите на название нужного препарата, чтобы открыть его карточку с подробной информацией (количество, заметки, срок годности).
+    •   В этом же окне доступны кнопки для <b>изменения</b> любого из указанных полей или для <b>удаления</b> данной записи.
+
+4.  <b>Удаление лекарства</b> 🗑️
+    •   В режиме просмотра деталей препарата (см. пункт 3), нажмите кнопку "🗑️ Удалить лекарство".
+    •   Бот запросит подтверждение для предотвращения случайного удаления. После подтверждения запись будет удалена.
+
+5.  <b>Поиск через @ (Inline-режим)</b> 🔍
+    •   Для быстрого поиска лекарства в вашей аптечке из любого чата Telegram, введите <code>@имя_вашего_бота</code> (например, <code>@medicount_bot</code>) и через пробел начните вводить название препарата.
+    •   Бот отобразит совпадающие записи из вашего личного списка. При выборе результата будет отправлено сообщение с деталями и кнопкой "Посмотреть / Изменить".
+
+6.  <b>Отмена действия</b> ❌
+    •   Если вы начали процесс добавления или редактирования лекарства и хотите его прервать, используйте inline-кнопку "❌ Отмена", которая отображается на соответствующих шагах.
+    •   Также можно отправить сообщение с текстом "отмена". Вы вернетесь к предыдущему шагу или в главное меню.
+
+7.  <b>Напоминания о сроках годности</b> 📅
+    •   Бот автоматически проверяет сроки годности лекарств в вашем списке ежедневно.
+    •   При обнаружении препаратов, срок годности которых истекает в течение следующих 30 дней или уже истек, бот отправит вам соответствующее уведомление.
+
+•   <b>Дополнительно:</b>
+    ◦   Для возврата в главное меню или перезапуска бота используйте команду <code>/start</code>.
+    ◦   При возникновении технических проблем или вопросов, не описанных в руководстве, используйте кнопку "🛠️ Техническая поддержка" в главном меню для связи.
+
+Надеемся, данное руководство будет вам полезно.
+"""
+
+
 
 logger.add("bot.log", rotation="1 MB", level="INFO")
 storage = MemoryStorage()
@@ -53,8 +99,9 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=storage)
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[DB_NAME]
-med_collection = db[COLLECTION_NAME]
-
+med_collection = db[MED_COLLECTION_NAME]
+users_collection = db["users"]
+support_username = os.getenv("SUPPORT_USERNAME")
 
 
 # --- CallbackData Factories ---
@@ -90,6 +137,9 @@ class AddMedicine(StatesGroup):
     quantity: str | None = None
     notes: str | None = None
     exp_date: str | None = None
+
+class Registration(StatesGroup):
+    waiting_for_contact = State()
 
 class EditMedicine(StatesGroup):
     waiting_for_new_value = State()
@@ -127,13 +177,24 @@ def get_confirm_barcode_update_keyboard(med_name: str) -> InlineKeyboardMarkup:
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     """Создает клавиатуру главного меню (БЕЗ КНОПКИ ПОИСКА)."""
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💊 Список лекарств", callback_data=MedAction(action="list", page=1).pack())],
-        [InlineKeyboardButton(text="➕ Добавить лекарство", callback_data=MedAction(action="add").pack())],
+        [InlineKeyboardButton(
+            text="💊 Список лекарств", callback_data=MedAction(action="list", page=1).pack()
+        )],
+        [InlineKeyboardButton(
+            text="➕ Добавить лекарство", callback_data=MedAction(action="add").pack()
+        )],
         [InlineKeyboardButton(
             text=f"🔍 Начать поиск",
             switch_inline_query_current_chat=" " # Вставляем только @имя_бота
             # ------------------------------------------
         )],
+        [InlineKeyboardButton(
+            text="🛠️ Техническая поддержка",
+            url=f"https://t.me/{support_username}" # Ссылка на пользователя поддержки
+        )],
+        [InlineKeyboardButton(
+            text="❓ Помощь", callback_data="show_help"
+        )]
     ])
     return kb
 
@@ -277,7 +338,109 @@ async def create_calendar(year: int | None = None, month: int | None = None) -> 
 # -----------------------------
 # Helper Functions
 # -----------------------------
-# --- ИЗМЕНЕНИЕ: Добавлен inline_message_id ---
+
+def require_phone_number(handler_func):
+    """
+    Декоратор или функция-обертка для проверки наличия номера телефона
+    перед выполнением основного действия обработчика.
+    """
+    async def wrapper(event: types.Message | types.CallbackQuery, state: FSMContext, *args, **kwargs):
+        user_id = event.from_user.id
+        user_data = await get_user_data(user_id)
+        has_phone = user_data and user_data.get("phone_number")
+
+        if has_phone:
+            # Телефон есть, выполняем основной обработчик
+            await update_user_last_seen(user_id) # Обновляем визит
+            return await handler_func(event, state)
+        else:
+            # Телефона нет, запрашиваем
+            logger.info(f"User {user_id} attempted action requiring phone, but phone is missing. Prompting.")
+
+            prompt_text = (
+                "⚠️ Для выполнения этого действия (и получения напоминаний) "
+                "необходимо указать ваш номер телефона.\n\n"
+                "Пожалуйста, **поделитесь вашим номером**, нажав кнопку ниже. Это нужно сделать только один раз."
+            )
+            contact_kb = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="📱 Поделиться номером телефона", request_contact=True)]],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+
+            # Отправляем запрос
+            if isinstance(event, types.CallbackQuery):
+                # Если это callback, отвечаем на него и отправляем новое сообщение
+                await event.answer("Требуется номер телефона", show_alert=False)
+                if event.message:
+                    await event.message.answer(prompt_text, reply_markup=contact_kb)
+            elif isinstance(event, types.Message):
+                 # Если это сообщение, отвечаем на него
+                 await event.answer(prompt_text, reply_markup=contact_kb)
+
+            # Устанавливаем состояние ожидания контакта
+            await state.set_state(Registration.waiting_for_contact)
+            # Сохраняем данные пользователя на всякий случай
+            await state.update_data(
+                first_name=event.from_user.first_name,
+                username=event.from_user.username
+            )
+            # Здесь можно было бы сохранить исходный callback/команду,
+            # чтобы вернуться к ней после получения номера, но для простоты
+            # пока просто отправим пользователя в главное меню после process_contact.
+            return # Прерываем выполнение исходного хендлера
+
+    return wrapper
+
+async def get_user_data(user_id: int) -> dict | None:
+    """Получает данные пользователя из коллекции users."""
+    try:
+        user_data = await users_collection.find_one({"_id": user_id})
+        return user_data
+    except Exception as e:
+        logger.error(f"Error getting user data for user {user_id}: {e}")
+        return None
+
+async def update_user_phone(user_id: int, phone_number: str, first_name: str | None = None, username: str | None = None):
+    """Обновляет или создает запись пользователя с номером телефона."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    update_fields = {
+        "phone_number": phone_number,
+        "last_seen_at": now
+    }
+    if first_name:
+        update_fields["first_name"] = first_name
+    if username:
+        update_fields["username"] = username
+
+    try:
+        await users_collection.update_one(
+            {"_id": user_id},
+            {
+                "$set": update_fields,
+                "$setOnInsert": { # Эти поля установятся только при первой вставке
+                    "registered_at": now
+                 }
+            },
+            upsert=True # Создаст документ, если пользователь не найден
+        )
+        logger.info(f"Updated phone number for user {user_id}.")
+        return True
+    except Exception as e:
+        logger.error(f"Error updating user phone for user {user_id}: {e}")
+        return False
+    
+async def update_user_last_seen(user_id: int):
+    """Обновляет время последнего взаимодействия пользователя."""
+    try:
+        await users_collection.update_one(
+            {"_id": user_id},
+            {"$set": {"last_seen_at": datetime.datetime.now(datetime.timezone.utc)}}
+        )
+        # Можно добавить $setOnInsert, если нужно создавать запись при любом действии
+    except Exception as e:
+        logger.warning(f"Could not update last_seen for user {user_id}: {e}")
+
 async def safe_edit_message(text: str,
                            chat_id: int | None = None,
                            message_id: int | None = None,
@@ -363,6 +526,14 @@ async def show_main_menu_message(chat_id: int | None = None, message_id: int | N
     kb = get_main_menu_keyboard()
     # --- ИЗМЕНЕНИЕ: Передаем все параметры в safe_edit_message ---
     await safe_edit_message(text, chat_id=chat_id, message_id=message_id, inline_message_id=inline_message_id, reply_markup=kb)
+
+async def create_users_index():
+    try:
+        await users_collection.create_index("_id")
+        logger.info("Ensured index on 'users._id'.")
+    except Exception as e:
+        logger.error(f"Error creating/ensuring index on 'users._id': {e}")
+
 
 async def create_db_indexes():
     """Создает необходимые индексы в MongoDB."""
@@ -568,122 +739,170 @@ def transliterate(text: str) -> str:
 # -----------------------------
 # Command Handlers
 # -----------------------------
-@dp.message(Command("start"), StateFilter(None))
-async def start_handler(message: types.Message):
-    """Обработчик команды /start. Показывает приветствие и главное меню."""
-    text = (
-        "👋 Привет! Я бот для учета лекарств в домашней аптечке.\n\n"
-        "Я помогу тебе вести список лекарств, отслеживать сроки годности и быстро находить нужные препараты.\n\n"
-        "Используй кнопки ниже для навигации или команду /help для получения инструкции."
-        )
-    kb = get_main_menu_keyboard()
-    await message.answer(text, reply_markup=kb)
 
-@dp.message(Command("help"), StateFilter(None))
-async def help_command(message: types.Message):
-    """Выводит инструкцию по использованию бота."""
-    help_text = """
-    📖 *Как пользоваться ботом "Домашняя аптечка"*
-
-    Этот бот помогает вести список ваших лекарств. Вот что он умеет:
-
-    1️⃣ *Добавить лекарство*
-    Нажмите "➕ Добавить лекарство" или введите команду /add.
-    Вы можете написать название лекарства или отправить фото с его штрихкодом.
-    Бот попросит указать количество, срок годности и заметку (например, дозировку).
-
-    2️⃣ *Посмотреть список*
-    Нажмите "💊 Список лекарств" или введите команду /list.
-    Используйте стрелки, чтобы листать страницы.
-
-    3️⃣ *Посмотреть и изменить детали*
-    Нажмите на нужное лекарство в списке.
-    Вы сможете изменить название, количество, заметку или срок годности.
-    Также можно удалить лекарство.
-
-    4️⃣ *Удалить лекарство*
-    Откройте нужное лекарство и нажмите "🗑️ Удалить лекарство".
-    Бот спросит подтверждение.
-
-    5️⃣ *Поиск через @*
-    В любом чате напишите `@имя_вашего_бота` и название лекарства.
-    Пример: `@medicount_bot аспирин`
-    Бот покажет подходящие варианты из вашей аптечки. Нажмите на нужный — бот отправит его описание с кнопкой просмотра деталей. Нажмите на кнопку, чтобы отредактировать это лекарство.
-
-    6️⃣ *Отмена действия*
-    Если передумали — нажмите "❌ Отмена", введите "отмена" или команду /cancel.
-
-    📅 *Напоминания*
-    Бот сам проверяет сроки годности и может напоминать, если что-то скоро испортится.
-
-    Если что-то пошло не так — начните с команды /start.
-    """
-    await message.answer(help_text, parse_mode="Markdown", disable_web_page_preview=True)
-
-@dp.message(Command("list"), StateFilter(None))
-async def list_medicines_command(message: types.Message):
-    """Обработчик команды /list. Показывает лекарства ТЕКУЩЕГО пользователя (страница 1)."""
+@dp.message(Registration.waiting_for_contact, F.contact)
+async def process_contact(message: types.Message, state: FSMContext):
+    """Обрабатывает полученный контакт, сохраняет его и показывает главное меню."""
+    contact = message.contact
     user_id = message.from_user.id
-    # Отправляем новое сообщение со списком, т.к. у нас нет message_id для редактирования
-    medicines = await _get_user_medicines(user_id)
-    kb = get_medicine_list_keyboard(medicines, current_page=1, context="list")
-    text = "Ваши лекарства:" if medicines else "Список лекарств пуст."
-    total_pages = (len(medicines) + MEDS_PER_PAGE - 1) // MEDS_PER_PAGE
-    if total_pages > 1:
-        text = f"Ваши лекарства (Страница 1/{total_pages}):"
-    await message.answer(text, reply_markup=kb)
+    phone_number = contact.phone_number
 
+    # Получаем first_name и username из state, если они там были сохранены из start_handler
+    state_data = await state.get_data()
+    first_name = state_data.get("first_name", message.from_user.first_name)
+    username = state_data.get("username", message.from_user.username)
 
-@dp.message(Command("add"), StateFilter(None))
-async def add_medicine_command(message: types.Message, state: FSMContext):
-    """Запускает процесс добавления лекарства через команду /add."""
-    sent_message = await message.answer(
-        "➕ Добавление нового препарата.\n\n"
-        "Введите *точное название* или отправьте *фотографию штрихкода*:",
-        parse_mode="Markdown",
-        reply_markup=get_cancel_keyboard()
-    )
-    await state.set_state(AddMedicine.waiting_for_name)
-    # Сохраняем ID сообщения бота для дальнейшего редактирования
-    await state.update_data(prompt_chat_id=sent_message.chat.id, prompt_message_id=sent_message.message_id)
+    logger.info(f"Received contact from user {user_id}: {phone_number}")
 
+    # Сохраняем номер телефона в базу
+    success = await update_user_phone(user_id, phone_number, first_name, username)
 
-@dp.message(Command("cancel"))
-@dp.message(F.text.casefold() == "отмена", StateFilter("*"))
-async def cancel_handler(message: types.Message, state: FSMContext):
-    """Отменяет текущее действие FSM (через команду /cancel или текст)."""
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer("Нет активного действия для отмены.", reply_markup=ReplyKeyboardRemove())
-        return
+    if success:
+        await update_user_last_seen(user_id)
+        await message.answer(
+            "Спасибо! Ваш номер сохранен.\n\n"
+            "Теперь вы можете пользоваться всеми функциями бота. Используйте кнопки ниже:",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    else:
+        await message.answer(
+            "Произошла ошибка при сохранении номера. Попробуйте позже.\n\n"
+             "Пока можно пользоваться основными функциями:",
+             reply_markup=ReplyKeyboardRemove()
+        )
 
-    logger.info(f"Cancelling state {current_state} via command/text for user {message.from_user.id}")
-    user_data = await state.get_data()
-    # Пытаемся найти ID сообщения, которое редактировали (календарь, обычное или inline)
-    message_id_to_edit = user_data.get("calendar_message_id") or user_data.get("prompt_message_id")
-    inline_message_id_to_edit = user_data.get("inline_message_id")
-    chat_id_to_edit = user_data.get("prompt_chat_id") # chat_id нужен только для обычных сообщений
+    # Показываем главное меню
+    main_menu_text = "🏠 Домашняя аптечка\n\nВыберите действие:"
+    kb = get_main_menu_keyboard()
+    await message.answer(main_menu_text, reply_markup=kb)
 
     await state.clear()
 
-    try:
-        await message.delete() # Удаляем сообщение пользователя (/cancel или "отмена")
-    except Exception as e:
-        logger.warning(f"Could not delete user cancel message: {e}")
+@dp.message(Command("start"), StateFilter(None))
+async def start_handler(message: types.Message, state: FSMContext):
+    """Обрабатывает /start, проверяет наличие телефона."""
+    user_id = message.from_user.id
+    user_mention = message.from_user.mention_html()
+    first_name = message.from_user.first_name
+    username = message.from_user.username
 
-    if inline_message_id_to_edit:
-        # Если отменяли действие с inline-сообщением, показываем на нем главное меню
-        await show_main_menu_message(inline_message_id=inline_message_id_to_edit)
-    elif chat_id_to_edit and message_id_to_edit:
-        # Если было сообщение FSM (приглашение или календарь), возвращаем его в главное меню
-        await show_main_menu_message(chat_id=chat_id_to_edit, message_id=message_id_to_edit)
+    await update_user_last_seen(user_id) # Обновляем время визита
+
+    user_data = await get_user_data(user_id)
+    has_phone = user_data and user_data.get("phone_number")
+
+    company_link = "https://stratton.kz/"
+    company_name = "Stratton.kz"
+
+    if has_phone:
+        # Пользователь уже зарегистрирован с телефоном
+        await update_user_last_seen(user_id)
+        logger.info(f"User {user_id} already registered with phone. Showing main menu.")
+        welcome_text = (
+            f"С возвращением, {user_mention}! 👋\n\n"
+            "Рад снова видеть вас в аптечке от "
+            f"<a href='{company_link}'>{company_name}</a>.\n\n"
+            "Выберите действие:"
+        )
+        kb = get_main_menu_keyboard()
+        await message.answer(welcome_text, reply_markup=kb, parse_mode="HTML")
+        # Убедимся, что состояние чистое, если пользователь как-то попал сюда из FSM
+        await state.clear()
     else:
-        # Если не нашли ID (например, отмена сразу после /add), просто говорим об отмене
-        # и показываем меню новым сообщением
-         await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
-         await start_handler(message) # Показываем главное меню новым сообщением
+        # Пользователя нет или у него нет телефона - начинаем регистрацию
+        logger.info(f"User {user_id} not registered or no phone. Starting registration.")
+        welcome_text = (
+            f"Приветствую, {user_mention}! 🙂🤝🏼\n\n"
+            f"Я — бот компании <a href='{company_link}'>{company_name}</a>.\n"
+            "Я помогу вам управлять вашей домашней аптечкой: отслеживать лекарства и их сроки годности.\n\n"
+            "Для полноценной работы и получения напоминаний об истекающих сроках, "
+            "пожалуйста, **поделитесь вашим номером телефона**, нажав кнопку ниже."
+        )
+
+        contact_kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 Поделиться номером телефона", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+
+        await message.answer(welcome_text, reply_markup=contact_kb, parse_mode="HTML")
+        # Сохраняем данные пользователя (имя, юзернейм) на случай, если это его первая регистрация
+        await state.set_state(Registration.waiting_for_contact)
+        await state.update_data(first_name=first_name, username=username) # Сохраняем для update_user_phone
+
+# obsolete command handlers
+# 
+# @dp.message(Command("help"), StateFilter(None))
+# async def help_command(message: types.Message):
+#     """Выводит инструкцию по использованию бота."""
+#     help_text = HELP_TEXT
+#     await message.answer(help_text, parse_mode="Markdown", disable_web_page_preview=True)
+
+# @dp.message(Command("list"), StateFilter(None))
+# async def list_medicines_command(message: types.Message):
+#     """Обработчик команды /list. Показывает лекарства ТЕКУЩЕГО пользователя (страница 1)."""
+#     user_id = message.from_user.id
+#     # Отправляем новое сообщение со списком, т.к. у нас нет message_id для редактирования
+#     medicines = await _get_user_medicines(user_id)
+#     kb = get_medicine_list_keyboard(medicines, current_page=1, context="list")
+#     text = "Ваши лекарства:" if medicines else "Список лекарств пуст."
+#     total_pages = (len(medicines) + MEDS_PER_PAGE - 1) // MEDS_PER_PAGE
+#     if total_pages > 1:
+#         text = f"Ваши лекарства (Страница 1/{total_pages}):"
+#     await message.answer(text, reply_markup=kb)
+
+
+# @dp.message(Command("add"), StateFilter(None))
+# async def add_medicine_command(message: types.Message, state: FSMContext):
+#     """Запускает процесс добавления лекарства через команду /add."""
+#     sent_message = await message.answer(
+#         "➕ Добавление нового препарата.\n\n"
+#         "Введите *точное название* или отправьте *фотографию штрихкода*:",
+#         parse_mode="Markdown",
+#         reply_markup=get_cancel_keyboard()
+#     )
+#     await state.set_state(AddMedicine.waiting_for_name)
+#     # Сохраняем ID сообщения бота для дальнейшего редактирования
+#     await state.update_data(prompt_chat_id=sent_message.chat.id, prompt_message_id=sent_message.message_id)
+
+
+# @dp.message(Command("cancel"))
+# @dp.message(F.text.casefold() == "отмена", StateFilter("*"))
+# async def cancel_handler(message: types.Message, state: FSMContext):
+#     """Отменяет текущее действие FSM (через команду /cancel или текст)."""
+#     current_state = await state.get_state()
+#     if current_state is None:
+#         await message.answer("Нет активного действия для отмены.", reply_markup=ReplyKeyboardRemove())
+#         return
+
+#     logger.info(f"Cancelling state {current_state} via command/text for user {message.from_user.id}")
+#     user_data = await state.get_data()
+#     # Пытаемся найти ID сообщения, которое редактировали (календарь, обычное или inline)
+#     message_id_to_edit = user_data.get("calendar_message_id") or user_data.get("prompt_message_id")
+#     inline_message_id_to_edit = user_data.get("inline_message_id")
+#     chat_id_to_edit = user_data.get("prompt_chat_id") # chat_id нужен только для обычных сообщений
+
+#     await state.clear()
+
+#     try:
+#         await message.delete() # Удаляем сообщение пользователя (/cancel или "отмена")
+#     except Exception as e:
+#         logger.warning(f"Could not delete user cancel message: {e}")
+
+#     if inline_message_id_to_edit:
+#         # Если отменяли действие с inline-сообщением, показываем на нем главное меню
+#         await show_main_menu_message(inline_message_id=inline_message_id_to_edit)
+#     elif chat_id_to_edit and message_id_to_edit:
+#         # Если было сообщение FSM (приглашение или календарь), возвращаем его в главное меню
+#         await show_main_menu_message(chat_id=chat_id_to_edit, message_id=message_id_to_edit)
+#     else:
+#         # Если не нашли ID (например, отмена сразу после /add), просто говорим об отмене
+#         # и показываем меню новым сообщением
+#          await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
+#          await start_handler(message) # Показываем главное меню новым сообщением
 
 # --- FSM Handlers for Adding Medicine ---
+
 
 @dp.message(AddMedicine.waiting_for_name, F.text)
 async def process_medicine_name_text(message: types.Message, state: FSMContext):
@@ -1142,7 +1361,8 @@ async def _save_edited_medicine(user_id: int, med_id: str, field_to_edit: str, n
 
 # --- Inline Query Handler ---
 @dp.inline_query()
-async def inline_search_handler(inline_query: InlineQuery):
+@require_phone_number
+async def inline_search_handler(inline_query: InlineQuery, state: FSMContext):
     query = inline_query.query.strip()
     user_id = inline_query.from_user.id
     results = []
@@ -1233,6 +1453,26 @@ async def inline_search_handler(inline_query: InlineQuery):
 # Callback Query Handlers
 # -----------------------------
 
+@dp.callback_query(F.data == "show_help", StateFilter(None))
+async def show_help_callback(callback: types.CallbackQuery):
+    if callback.message:
+        # Редактируем текущее сообщение, показывая помощь
+        await safe_edit_message(
+            text=HELP_TEXT,
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+            parse_mode="HTML",
+            # disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                # Добавляем кнопку "Назад" к главному меню
+                [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main_menu")]
+            ])
+        )
+        await callback.answer()
+    else:
+        # Если вдруг вызвано из inline (хотя кнопки там нет)
+        await callback.answer(HELP_TEXT, show_alert=True)
+
 @dp.callback_query(MedAction.filter(F.action == "hide_inline_info"), StateFilter(None))
 async def hide_inline_info_callback(callback: types.CallbackQuery):
     """Скрывает (редактирует на символ) сообщение, отправленное через inline-режим."""
@@ -1309,6 +1549,7 @@ async def back_to_list_callback(callback: types.CallbackQuery):
 
 # --- Add Medicine Flow ---
 @dp.callback_query(MedAction.filter(F.action == "add"), StateFilter(None))
+@require_phone_number
 async def add_medicine_callback_start(callback: types.CallbackQuery, state: FSMContext):
     # Добавление возможно только из обычного сообщения
     if not callback.message:
@@ -1578,6 +1819,7 @@ async def delete_medicine_confirm(callback: types.CallbackQuery, callback_data: 
 # --- Edit Medicine Flow ---
 # --- ИЗМЕНЕНИЕ: Обрабатываем колбэки от обычных и inline сообщений ---
 @dp.callback_query(MedAction.filter(F.action == "edit"), StateFilter(None))
+@require_phone_number
 async def edit_medicine_field_start(callback: types.CallbackQuery, callback_data: MedAction, state: FSMContext):
     """Начинает FSM для редактирования выбранного поля (из списка или inline)."""
     user_id = callback.from_user.id
@@ -1873,11 +2115,8 @@ async def on_shutdown_global_client(bot: Bot):
 async def set_bot_commands(bot: Bot):
     """Устанавливает список команд для кнопки Menu."""
     commands = [
-        BotCommand(command="/start", description="🏠 Перезапустить / Главное меню"),
-        BotCommand(command="/help", description="❓ Помощь по боту"),
-        BotCommand(command="/list", description="💊 Показать список лекарств"),
-        BotCommand(command="/add", description="➕ Добавить новое лекарство"),
-        BotCommand(command="/cancel", description="❌ Отменить текущее действие"),
+        BotCommand(command="/start", description="🏠 Перезапустить / Главное меню")
+        # Убрали остальные команды
     ]
     try:
         await bot.set_my_commands(commands)
@@ -1889,6 +2128,7 @@ async def set_bot_commands(bot: Bot):
 async def main():
     dp.shutdown.register(on_shutdown_global_client)
     await create_db_indexes()
+    await create_users_index()
     await set_bot_commands(bot)
     logger.info("Deleting any existing webhook configuration...")
     
@@ -1912,3 +2152,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.warning("Bot stopped by user (KeyboardInterrupt/SystemExit)")
+
